@@ -361,6 +361,92 @@ def probe_media_info(filepath: Path) -> Dict[str, str]:
     return info
 
 
+def detect_hardware_backend() -> Dict[str, object]:
+    """
+    Auto-detect available compute backends (NVIDIA CUDA, AMD ROCm/HIP, Vulkan, Intel SYCL/OpenVINO, Apple Metal, or CPU)
+    by probing whisper-cli / ggml backends and system GPU utilities.
+    Works across NVIDIA, AMD, Intel, Apple Silicon, and CPU-only machines.
+    """
+    hw = {
+        "has_gpu": False,
+        "backend": "CPU",
+        "device_name": f"Multi-Core CPU ({os.cpu_count() or 4} threads)",
+        "whisper_bin": shutil.which("whisper-cli") or shutil.which("whisper-cpp") or shutil.which("main") or "whisper-cli",
+    }
+
+    # 1. Inspect whisper-cli startup output for loaded ggml backends & GPU device names
+    try:
+        res = subprocess.run(
+            [str(hw["whisper_bin"]), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        out = (res.stdout or "") + "\n" + (res.stderr or "")
+
+        # Check CUDA / NVIDIA
+        cuda_match = re.search(r"ggml_cuda.*?:\s*0\s*=\s*([^\n|]+)", out, re.IGNORECASE)
+        if cuda_match or "libggml-cuda" in out.lower():
+            hw["has_gpu"] = True
+            hw["backend"] = "NVIDIA CUDA"
+            hw["device_name"] = cuda_match.group(1).strip() if cuda_match else "NVIDIA GPU (CUDA)"
+            return hw
+
+        # Check ROCm / HIP
+        hip_match = re.search(r"ggml_(?:hip|rocm).*?:\s*0\s*=\s*([^\n|]+)", out, re.IGNORECASE)
+        if hip_match or "libggml-hip" in out.lower():
+            hw["has_gpu"] = True
+            hw["backend"] = "AMD ROCm"
+            hw["device_name"] = hip_match.group(1).strip() if hip_match else "AMD GPU (ROCm/HIP)"
+            return hw
+
+        # Check Vulkan (works on NVIDIA, AMD, Intel)
+        vk_match = re.search(r"ggml_vulkan:\s*0\s*=\s*([^\n|]+)", out, re.IGNORECASE)
+        if vk_match or "libggml-vulkan" in out.lower():
+            hw["has_gpu"] = True
+            hw["backend"] = "Vulkan GPU"
+            dev = vk_match.group(1).strip() if vk_match else "Vulkan-Compatible GPU"
+            # Clean up trailing driver parentheticals if overly long
+            hw["device_name"] = dev
+            return hw
+
+        # Check SYCL / OpenVINO (Intel Arc / iGPU)
+        if "libggml-sycl" in out.lower() or "libggml-openvino" in out.lower():
+            hw["has_gpu"] = True
+            hw["backend"] = "Intel OneAPI / OpenVINO"
+            hw["device_name"] = "Intel GPU / NPU"
+            return hw
+
+        # Check Metal (Apple Silicon)
+        if "ggml_metal" in out.lower() or "libggml-metal" in out.lower():
+            hw["has_gpu"] = True
+            hw["backend"] = "Apple Metal"
+            hw["device_name"] = "Apple Silicon GPU"
+            return hw
+    except Exception:
+        pass
+
+    # 2. Fallback check via nvidia-smi if whisper-cli didn't print backend on --help
+    if shutil.which("nvidia-smi"):
+        try:
+            res = subprocess.run(
+                ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if res.returncode == 0 and res.stdout.strip():
+                gpu_name = res.stdout.strip().splitlines()[0]
+                if Path("/usr/lib/ggml/libggml-cuda.so").exists() or Path("/usr/lib/ggml/libggml-vulkan.so").exists():
+                    hw["has_gpu"] = True
+                    hw["backend"] = "NVIDIA CUDA" if Path("/usr/lib/ggml/libggml-cuda.so").exists() else "Vulkan GPU"
+                    hw["device_name"] = gpu_name
+        except Exception:
+            pass
+
+    return hw
+
+
 class ModelManagerDialog(Adw.Window):
     """Dialog for inspecting, downloading, or deleting Whisper models in ~/.local/share/whisper-cpp/models/."""
 
@@ -493,6 +579,7 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
 
+        self.hw_info = detect_hardware_backend()
         self.settings = self.load_settings()
         self.current_file: Optional[Path] = None
         self.segments: List[Segment] = []
@@ -519,7 +606,7 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
             "language": "auto",
             "translate_to_en": False,
             "use_vad": True,
-            "use_gpu": True,
+            "use_gpu": bool(self.hw_info.get("has_gpu", True)),
             "show_timestamps": True,
             "threads": min(8, os.cpu_count() or 4),
         }
@@ -543,9 +630,10 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
 
         # Top HeaderBar
         header = Adw.HeaderBar()
+        hw_label = f"{self.hw_info['backend']}: {self.hw_info['device_name']}"
         title_widget = Adw.WindowTitle(
             title="Omarchy Transcribe Studio",
-            subtitle="Local Whisper.cpp Audio & Video Speech-to-Text (Vulkan GPU + Silero VAD)",
+            subtitle=f"Local Whisper.cpp Audio and Video Transcriber ({hw_label})",
         )
         header.set_title_widget(title_widget)
 
@@ -696,10 +784,18 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
         self.vad_switch.connect("notify::active", self.on_settings_toggled)
         engine_group.add(self.vad_switch)
 
+        if self.hw_info["has_gpu"]:
+            gpu_title = f"GPU Acceleration ({self.hw_info['backend']})"
+            gpu_sub = f"Detected: {self.hw_info['device_name']}"
+        else:
+            gpu_title = "GPU Acceleration (Fallback to Multi-Core CPU)"
+            gpu_sub = f"No GPU backend detected — using {self.hw_info['device_name']}"
+
         self.gpu_switch = Adw.SwitchRow(
-            title="Vulkan GPU Acceleration",
-            subtitle="Use AMD Radeon GPU for faster inference",
-            active=self.settings.get("use_gpu", True),
+            title=gpu_title,
+            subtitle=gpu_sub,
+            active=self.settings.get("use_gpu", True) and bool(self.hw_info["has_gpu"]),
+            sensitive=bool(self.hw_info["has_gpu"]),
         )
         self.gpu_switch.connect("notify::active", self.on_settings_toggled)
         engine_group.add(self.gpu_switch)
@@ -1096,15 +1192,36 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.record_temp_path = rec_dir / f"mic_recording_{stamp}.wav"
 
+        # Universal Linux / PipeWire / PulseAudio / ALSA / FFmpeg recording fallback
+        if shutil.which("pw-record"):
+            rec_cmd = [
+                "pw-record",
+                "--rate=16000",
+                "--channels=1",
+                "--format=s16",
+                str(self.record_temp_path),
+            ]
+        elif shutil.which("arecord"):
+            rec_cmd = [
+                "arecord",
+                "-f", "S16_LE",
+                "-r", "16000",
+                "-c", "1",
+                str(self.record_temp_path),
+            ]
+        else:
+            rec_cmd = [
+                "ffmpeg", "-y",
+                "-f", "pulse",
+                "-i", "default",
+                "-ar", "16000",
+                "-ac", "1",
+                str(self.record_temp_path),
+            ]
+
         try:
             self.record_process = subprocess.Popen(
-                [
-                    "pw-record",
-                    "--rate=16000",
-                    "--channels=1",
-                    "--format=s16",
-                    str(self.record_temp_path),
-                ],
+                rec_cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -1198,7 +1315,7 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
         lang_code = LANGUAGES[self.lang_row.get_selected()][0]
         translate = self.translate_switch.get_active()
         use_vad = self.vad_switch.get_active()
-        use_gpu = self.gpu_switch.get_active()
+        use_gpu = self.gpu_switch.get_active() and bool(self.hw_info["has_gpu"])
 
         self.is_transcribing = True
         self.cancel_requested = False
@@ -1253,15 +1370,17 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
                         pass
 
                 # Step 3: Run whisper-cli and stream segments + progress
+                target_accel = str(self.hw_info["backend"]) if use_gpu else "Multi-Core CPU"
                 GLib.idle_add(
                     self.update_download_progress,
                     0.05,
-                    f"Loading {model.name} on {'Vulkan GPU' if use_gpu else 'CPU'}...",
+                    f"Loading {model.name} on {target_accel}...",
                 )
 
                 threads = str(self.settings.get("threads", min(8, os.cpu_count() or 4)))
+                whisper_bin = str(self.hw_info.get("whisper_bin", "whisper-cli"))
                 w_cmd = [
-                    "whisper-cli",
+                    whisper_bin,
                     "-m", str(model.path),
                     "-f", str(tmp_wav),
                     "-l", lang_code,
@@ -1427,11 +1546,14 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
             self.show_toast("Nothing to copy yet!")
             return
 
-        # Copy via GDK4 clipboard + wl-copy fallback
+        # Copy via GDK4 clipboard + Wayland (wl-copy) / X11 (xclip/xsel) fallbacks
         clipboard = self.get_clipboard()
         clipboard.set(text)
         try:
-            subprocess.run(["wl-copy"], input=text, text=True, timeout=2)
+            if shutil.which("wl-copy"):
+                subprocess.run(["wl-copy"], input=text, text=True, timeout=2)
+            elif shutil.which("xclip"):
+                subprocess.run(["xclip", "-selection", "clipboard"], input=text, text=True, timeout=2)
         except Exception:
             pass
         self.show_toast("✓ Transcript copied to clipboard!")
