@@ -49,13 +49,10 @@ detect_and_install_deps() {
 
     # Check if core runtime tools are already present
     if command -v whisper-cli >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1 && python3 -c "import gi; gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1')" 2>/dev/null; then
-        # On Arch, check if NVIDIA user needs ggml-cuda / ggml-vulkan or AMD/Intel user needs ggml-vulkan
+        # On Arch, ensure ggml-vulkan (or ggml-cuda) is installed for GPU acceleration on NVIDIA/AMD/Intel
         if command -v pacman >/dev/null 2>&1; then
-            if [[ "$gpu_vendor" == "nvidia" ]] && ! pacman -Qi ggml-cuda >/dev/null 2>&1 && ! pacman -Qi ggml-vulkan >/dev/null 2>&1; then
-                echo "==> Installing GPU acceleration backend for NVIDIA..."
-                sudo pacman -S --needed --noconfirm ggml-cuda ggml-vulkan || sudo pacman -S --needed --noconfirm ggml-vulkan || true
-            elif [[ "$gpu_vendor" == "amd" || "$gpu_vendor" == "intel" ]] && ! pacman -Qi ggml-vulkan >/dev/null 2>&1; then
-                echo "==> Installing Vulkan GPU backend..."
+            if [[ "$gpu_vendor" != "cpu" ]] && ! pacman -Qi ggml-vulkan >/dev/null 2>&1 && ! pacman -Qi ggml-cuda >/dev/null 2>&1; then
+                echo "==> Installing GPU acceleration backend (ggml-vulkan)..."
                 sudo pacman -S --needed --noconfirm ggml-vulkan || true
             fi
         fi
@@ -65,13 +62,7 @@ detect_and_install_deps() {
     echo "==> Installing system dependencies..."
     if command -v pacman >/dev/null 2>&1; then
         local pkgs=(whisper-cpp ffmpeg python-gobject gtk4 libadwaita wl-clipboard libnotify)
-        if [[ "$gpu_vendor" == "nvidia" ]]; then
-            # Install Vulkan + CUDA backends on NVIDIA machines
-            pkgs+=(ggml-vulkan)
-            if pacman -Si ggml-cuda >/dev/null 2>&1; then
-                pkgs+=(ggml-cuda)
-            fi
-        elif [[ "$gpu_vendor" == "amd" || "$gpu_vendor" == "intel" ]]; then
+        if [[ "$gpu_vendor" != "cpu" ]]; then
             pkgs+=(ggml-vulkan)
         fi
         sudo pacman -S --needed --noconfirm "${pkgs[@]}"

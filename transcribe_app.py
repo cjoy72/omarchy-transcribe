@@ -365,14 +365,27 @@ def detect_hardware_backend() -> Dict[str, object]:
     """
     Auto-detect available compute backends (NVIDIA CUDA, AMD ROCm/HIP, Vulkan, Intel SYCL/OpenVINO, Apple Metal, or CPU)
     by probing whisper-cli / ggml backends and system GPU utilities.
-    Works across NVIDIA, AMD, Intel, Apple Silicon, and CPU-only machines.
+    Automatically prioritizes discrete NVIDIA / AMD GPUs over integrated GPUs on hybrid laptops.
     """
     hw = {
         "has_gpu": False,
         "backend": "CPU",
         "device_name": f"Multi-Core CPU ({os.cpu_count() or 4} threads)",
+        "device_index": 0,
         "whisper_bin": shutil.which("whisper-cli") or shutil.which("whisper-cpp") or shutil.which("main") or "whisper-cli",
     }
+
+    def pick_best_device(matches: List[Tuple[str, str]], default_name: str) -> Tuple[int, str]:
+        if not matches:
+            return 0, default_name
+        # Prefer discrete NVIDIA or AMD Radeon over integrated Intel if multiple GPUs exist
+        for idx_str, desc in matches:
+            if any(k in desc.lower() for k in ("nvidia", "geforce", "rtx", "gtx", "quadro", "tesla")):
+                return int(idx_str), desc.strip()
+        for idx_str, desc in matches:
+            if any(k in desc.lower() for k in ("radeon rx", "amd radeon", "radeon pro", "instinct")):
+                return int(idx_str), desc.strip()
+        return int(matches[0][0]), matches[0][1].strip()
 
     # 1. Inspect whisper-cli startup output for loaded ggml backends & GPU device names
     try:
@@ -385,29 +398,33 @@ def detect_hardware_backend() -> Dict[str, object]:
         out = (res.stdout or "") + "\n" + (res.stderr or "")
 
         # Check CUDA / NVIDIA
-        cuda_match = re.search(r"ggml_cuda.*?:\s*0\s*=\s*([^\n|]+)", out, re.IGNORECASE)
-        if cuda_match or "libggml-cuda" in out.lower():
+        cuda_matches = re.findall(r"ggml_cuda.*?:\s*(\d+)\s*=\s*([^\n|]+)", out, re.IGNORECASE)
+        if cuda_matches or "libggml-cuda" in out.lower():
+            dev_idx, dev_name = pick_best_device(cuda_matches, "NVIDIA GPU (CUDA)")
             hw["has_gpu"] = True
             hw["backend"] = "NVIDIA CUDA"
-            hw["device_name"] = cuda_match.group(1).strip() if cuda_match else "NVIDIA GPU (CUDA)"
+            hw["device_name"] = dev_name
+            hw["device_index"] = dev_idx
             return hw
 
         # Check ROCm / HIP
-        hip_match = re.search(r"ggml_(?:hip|rocm).*?:\s*0\s*=\s*([^\n|]+)", out, re.IGNORECASE)
-        if hip_match or "libggml-hip" in out.lower():
+        hip_matches = re.findall(r"ggml_(?:hip|rocm).*?:\s*(\d+)\s*=\s*([^\n|]+)", out, re.IGNORECASE)
+        if hip_matches or "libggml-hip" in out.lower():
+            dev_idx, dev_name = pick_best_device(hip_matches, "AMD GPU (ROCm/HIP)")
             hw["has_gpu"] = True
             hw["backend"] = "AMD ROCm"
-            hw["device_name"] = hip_match.group(1).strip() if hip_match else "AMD GPU (ROCm/HIP)"
+            hw["device_name"] = dev_name
+            hw["device_index"] = dev_idx
             return hw
 
-        # Check Vulkan (works on NVIDIA, AMD, Intel)
-        vk_match = re.search(r"ggml_vulkan:\s*0\s*=\s*([^\n|]+)", out, re.IGNORECASE)
-        if vk_match or "libggml-vulkan" in out.lower():
+        # Check Vulkan (works on NVIDIA, AMD, Intel — including hybrid Intel + NVIDIA laptops)
+        vk_matches = re.findall(r"ggml_vulkan:\s*(\d+)\s*=\s*([^\n|]+)", out, re.IGNORECASE)
+        if vk_matches or "libggml-vulkan" in out.lower():
+            dev_idx, dev_name = pick_best_device(vk_matches, "Vulkan-Compatible GPU")
             hw["has_gpu"] = True
-            hw["backend"] = "Vulkan GPU"
-            dev = vk_match.group(1).strip() if vk_match else "Vulkan-Compatible GPU"
-            # Clean up trailing driver parentheticals if overly long
-            hw["device_name"] = dev
+            hw["backend"] = "NVIDIA Vulkan GPU" if "nvidia" in dev_name.lower() else "Vulkan GPU"
+            hw["device_name"] = dev_name
+            hw["device_index"] = dev_idx
             return hw
 
         # Check SYCL / OpenVINO (Intel Arc / iGPU)
@@ -439,7 +456,7 @@ def detect_hardware_backend() -> Dict[str, object]:
                 gpu_name = res.stdout.strip().splitlines()[0]
                 if Path("/usr/lib/ggml/libggml-cuda.so").exists() or Path("/usr/lib/ggml/libggml-vulkan.so").exists():
                     hw["has_gpu"] = True
-                    hw["backend"] = "NVIDIA CUDA" if Path("/usr/lib/ggml/libggml-cuda.so").exists() else "Vulkan GPU"
+                    hw["backend"] = "NVIDIA CUDA" if Path("/usr/lib/ggml/libggml-cuda.so").exists() else "NVIDIA Vulkan GPU"
                     hw["device_name"] = gpu_name
         except Exception:
             pass
@@ -1391,6 +1408,8 @@ class TranscribeMainWindow(Adw.ApplicationWindow):
                     w_cmd.append("-tr")
                 if not use_gpu:
                     w_cmd.append("-ng")
+                elif int(self.hw_info.get("device_index", 0)) > 0:
+                    w_cmd.extend(["-dev", str(self.hw_info["device_index"])])
                 if use_vad and vad_model_path.exists():
                     w_cmd.extend(["--vad", "-vm", str(vad_model_path)])
 
@@ -1692,6 +1711,7 @@ def run_cli_mode(args: argparse.Namespace) -> int:
         tmp_wav = Path(tmp.name)
 
     try:
+        hw = detect_hardware_backend()
         subprocess.run(
             ["ffmpeg", "-y", "-i", str(filepath), "-vn", "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le", str(tmp_wav)],
             check=True,
@@ -1699,11 +1719,13 @@ def run_cli_mode(args: argparse.Namespace) -> int:
             stderr=subprocess.DEVNULL,
         )
         cmd = [
-            "whisper-cli",
+            str(hw.get("whisper_bin", "whisper-cli")),
             "-m", str(model.path),
             "-f", str(tmp_wav),
             "-l", args.language,
         ]
+        if int(hw.get("device_index", 0)) > 0:
+            cmd.extend(["-dev", str(hw["device_index"])])
         if args.translate:
             cmd.append("-tr")
         vad_path = MODELS_DIR / "ggml-silero-v6.2.0.bin"
