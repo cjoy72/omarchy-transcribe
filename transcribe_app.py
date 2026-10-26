@@ -29,6 +29,11 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango
 
+# Ensure ~/.local/bin is in PATH for child subprocesses
+local_bin = str(Path.home() / ".local/bin")
+if local_bin not in os.environ.get("PATH", "").split(os.pathsep):
+    os.environ["PATH"] = f"{local_bin}:{os.environ.get('PATH', '')}"
+
 # Global Paths (Adhering to Global Whisper Models Directory Rule)
 MODELS_DIR = Path(
     os.environ.get(
@@ -367,12 +372,20 @@ def detect_hardware_backend() -> Dict[str, object]:
     by probing whisper-cli / ggml backends and system GPU utilities.
     Automatically prioritizes discrete NVIDIA / AMD GPUs over integrated GPUs on hybrid laptops.
     """
+    whisper_bin = (
+        shutil.which("whisper-cli")
+        or shutil.which("whisper-cpp")
+        or shutil.which("main")
+        or (str(Path.home() / ".local/bin/whisper-cli") if (Path.home() / ".local/bin/whisper-cli").exists() else None)
+        or (str(Path.home() / ".local/lib/whisper-cpp/whisper-cli") if (Path.home() / ".local/lib/whisper-cpp/whisper-cli").exists() else None)
+        or "whisper-cli"
+    )
     hw = {
         "has_gpu": False,
         "backend": "CPU",
         "device_name": f"Multi-Core CPU ({os.cpu_count() or 4} threads)",
         "device_index": 0,
-        "whisper_bin": shutil.which("whisper-cli") or shutil.which("whisper-cpp") or shutil.which("main") or "whisper-cli",
+        "whisper_bin": whisper_bin,
     }
 
     def pick_best_device(matches: List[Tuple[str, str]], default_name: str) -> Tuple[int, str]:
@@ -434,7 +447,7 @@ def detect_hardware_backend() -> Dict[str, object]:
             hw["device_name"] = "Intel GPU / NPU"
             return hw
 
-        # Check Metal (Apple Silicon)
+        # Check Metal (macOS Apple Silicon)
         if "ggml_metal" in out.lower() or "libggml-metal" in out.lower():
             hw["has_gpu"] = True
             hw["backend"] = "Apple Metal"
@@ -458,6 +471,17 @@ def detect_hardware_backend() -> Dict[str, object]:
                     hw["has_gpu"] = True
                     hw["backend"] = "NVIDIA CUDA" if Path("/usr/lib/ggml/libggml-cuda.so").exists() else "NVIDIA Vulkan GPU"
                     hw["device_name"] = gpu_name
+        except Exception:
+            pass
+
+    # 3. Check for Apple Silicon Linux (Asahi / NEON + ARM_FMA acceleration)
+    if not hw["has_gpu"]:
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                cpuinfo = f.read()
+                if "apple" in cpuinfo.lower() or "m1" in cpuinfo.lower() or "m2" in cpuinfo.lower() or "m3" in cpuinfo.lower():
+                    hw["device_name"] = f"Apple Silicon ({os.cpu_count() or 8} Cores, NEON + ARM_FMA)"
+                    hw["backend"] = "Apple Silicon (NEON Accelerated)"
         except Exception:
             pass
 
@@ -1754,7 +1778,10 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    if parsed.cli and parsed.file:
+    if parsed.cli:
+        if not parsed.file:
+            print("Error: --cli mode requires an audio or video file.\nUsage: transcribe --cli <file> [-m MODEL] [-l LANG]", file=sys.stderr)
+            sys.exit(1)
         sys.exit(run_cli_mode(parsed))
 
     app = TranscribeApp(initial_file=parsed.file)

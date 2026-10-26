@@ -31,10 +31,19 @@ else
     SOURCE_DIR="$SHARE_DIR"
 fi
 
-# 2. Auto-detect GPU vendor (NVIDIA / AMD / Intel / CPU) & install missing packages if needed
+# 2. Auto-detect GPU vendor (NVIDIA / AMD / Intel / Apple Silicon / CPU) & install missing packages if needed
 detect_and_install_deps() {
+    local arch="$(uname -m)"
     local gpu_vendor="cpu"
-    if command -v nvidia-smi >/dev/null 2>&1 || (command -v lspci >/dev/null 2>&1 && lspci | grep -qi "nvidia"); then
+
+    if [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+        if grep -qi "apple" /proc/cpuinfo 2>/dev/null; then
+            gpu_vendor="apple"
+            echo "==> Detected Compute: Apple Silicon (NEON & ARM_FMA Optimized)"
+        else
+            echo "==> Detected Compute: ARM64 CPU"
+        fi
+    elif command -v nvidia-smi >/dev/null 2>&1 || (command -v lspci >/dev/null 2>&1 && lspci | grep -qi "nvidia"); then
         gpu_vendor="nvidia"
         echo "==> Detected GPU: NVIDIA"
     elif command -v lspci >/dev/null 2>&1 && lspci | grep -Eqi "amd|radeon|advanced micro devices"; then
@@ -47,30 +56,65 @@ detect_and_install_deps() {
         echo "==> Detected Compute: Multi-Core CPU"
     fi
 
-    # Check if core runtime tools are already present
-    if command -v whisper-cli >/dev/null 2>&1 && command -v ffmpeg >/dev/null 2>&1 && python3 -c "import gi; gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1')" 2>/dev/null; then
-        # On Arch, ensure ggml-vulkan (or ggml-cuda) is installed for GPU acceleration on NVIDIA/AMD/Intel
-        if command -v pacman >/dev/null 2>&1; then
-            if [[ "$gpu_vendor" != "cpu" ]] && ! pacman -Qi ggml-vulkan >/dev/null 2>&1 && ! pacman -Qi ggml-cuda >/dev/null 2>&1; then
-                echo "==> Installing GPU acceleration backend (ggml-vulkan)..."
-                sudo pacman -S --needed --noconfirm ggml-vulkan || true
-            fi
-        fi
-        return 0
+    # Check if core runtime GUI and media tools are already present
+    local need_sys_pkgs=0
+    if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1 || \
+       ! python3 -c "import gi; gi.require_version('Gtk', '4.0'); gi.require_version('Adw', '1')" 2>/dev/null || \
+       ! command -v wl-copy >/dev/null 2>&1 || ! command -v notify-send >/dev/null 2>&1; then
+        need_sys_pkgs=1
     fi
 
-    echo "==> Installing system dependencies..."
-    if command -v pacman >/dev/null 2>&1; then
-        local pkgs=(whisper-cpp ffmpeg python-gobject gtk4 libadwaita wl-clipboard libnotify)
-        if [[ "$gpu_vendor" != "cpu" ]]; then
-            pkgs+=(ggml-vulkan)
+    if (( need_sys_pkgs )); then
+        echo "==> Installing missing system dependencies..."
+        if command -v pacman >/dev/null 2>&1; then
+            local candidate_pkgs=(ffmpeg python-gobject gtk4 libadwaita wl-clipboard libnotify)
+            local to_install=()
+            for pkg in "${candidate_pkgs[@]}"; do
+                if pacman -Si "$pkg" >/dev/null 2>&1; then
+                    to_install+=("$pkg")
+                fi
+            done
+            # Only add whisper-cpp or ggml-vulkan if they exist in repos
+            if pacman -Si whisper-cpp >/dev/null 2>&1; then
+                to_install+=(whisper-cpp)
+            fi
+            if [[ "$gpu_vendor" != "cpu" && "$gpu_vendor" != "apple" ]] && pacman -Si ggml-vulkan >/dev/null 2>&1; then
+                to_install+=(ggml-vulkan)
+            fi
+            if (( ${#to_install[@]} > 0 )); then
+                sudo pacman -S --needed --noconfirm "${to_install[@]}" || true
+            fi
+        elif command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update || true
+            sudo apt-get install -y ffmpeg python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 wl-clipboard xclip libnotify-bin || true
+        elif command -v dnf >/dev/null 2>&1; then
+            sudo dnf install -y ffmpeg python3-gobject gtk4 libadwaita wl-clipboard xclip libnotify || true
         fi
-        sudo pacman -S --needed --noconfirm "${pkgs[@]}"
-    elif command -v apt-get >/dev/null 2>&1; then
-        sudo apt-get update
-        sudo apt-get install -y ffmpeg python3-gi python3-gi-cairo gir1.2-gtk-4.0 gir1.2-adw-1 wl-clipboard xclip libnotify-bin
-    elif command -v dnf >/dev/null 2>&1; then
-        sudo dnf install -y ffmpeg python3-gobject gtk4 libadwaita wl-clipboard xclip libnotify
+    fi
+
+    # Ensure whisper-cli is installed (download prebuilt binary if missing from PATH)
+    if ! command -v whisper-cli >/dev/null 2>&1 && ! command -v whisper-cpp >/dev/null 2>&1; then
+        echo "==> whisper-cli not found on PATH. Installing official prebuilt binary..."
+        local whisper_ver="b5454"
+        local whisper_tarball=""
+        if [[ "$arch" == "x86_64" ]]; then
+            whisper_tarball="whisper-bin-ubuntu-x64.tar.gz"
+        elif [[ "$arch" == "aarch64" || "$arch" == "arm64" ]]; then
+            whisper_tarball="whisper-bin-ubuntu-arm64.tar.gz"
+        fi
+
+        if [[ -n "$whisper_tarball" ]]; then
+            local target_lib="${HOME}/.local/lib/whisper-cpp"
+            mkdir -p "$target_lib" "$BIN_DIR"
+            echo "==> Downloading whisper.cpp ($whisper_ver for $arch)..."
+            curl -fsSL "https://github.com/ggerganov/whisper.cpp/releases/download/${whisper_ver}/${whisper_tarball}" | \
+                tar -xz --strip-components=1 -C "$target_lib"
+            ln -sfn "${target_lib}/whisper-cli" "${BIN_DIR}/whisper-cli"
+            chmod +x "${BIN_DIR}/whisper-cli"
+            echo "==> Installed whisper-cli to ${BIN_DIR}/whisper-cli"
+        else
+            echo "Warning: No prebuilt whisper-cli binary available for $arch. Please build whisper.cpp manually." >&2
+        fi
     fi
 }
 
@@ -79,7 +123,14 @@ detect_and_install_deps
 # 3. Set up directories, symlinks, launcher, and desktop entry
 mkdir -p "$BIN_DIR" "$APPS_DIR" "$MODELS_DIR"
 
+# Pre-fetch Silero VAD model (865 KB) if not already present for silence detection
+if [[ ! -f "$MODELS_DIR/ggml-silero-v6.2.0.bin" ]]; then
+    echo "==> Downloading Silero VAD model (865 KB) into $MODELS_DIR..."
+    curl -fsSL "https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v6.2.0.bin" -o "$MODELS_DIR/ggml-silero-v6.2.0.bin" || true
+fi
+
 if [[ "$SOURCE_DIR" != "$SHARE_DIR" ]]; then
+    rm -rf "$SHARE_DIR"
     ln -sfn "$SOURCE_DIR" "$SHARE_DIR"
 fi
 
@@ -89,6 +140,7 @@ cat > "$BIN_DIR/omarchy-transcribe" << 'EOF'
 #!/usr/bin/env bash
 # omarchy-transcribe - Modern Whisper transcription GUI for Omarchy & Linux
 
+export PATH="${HOME}/.local/bin:${PATH}"
 APP_SCRIPT="${HOME}/.local/share/omarchy-transcribe-gui/transcribe_app.py"
 
 exec python3 "$APP_SCRIPT" "$@"
